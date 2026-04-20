@@ -212,6 +212,31 @@ class ELOTClosedLoss(nn.Module):
         print("  PCA 奇异值最后 3 个: {}".format(
             [round(x, 4) for x in S[-3:].tolist()]))
         print("  学生投影层参数量: {:,}".format(s_dim * s_dim))
+
+        # ===== S_teacher 结构诊断 =====
+        off_mask = ~torch.eye(K, dtype=torch.bool)
+        off_values = S_teacher[off_mask]
+        print("\n  S_teacher 非对角统计:")
+        print("    mean={:.4f}  std={:.4f}  min={:.4f}  max={:.4f}".format(
+            off_values.mean().item(), off_values.std().item(),
+            off_values.min().item(), off_values.max().item()))
+        # 打印 top-5 最相似的类对
+        off_flat = S_teacher.clone()
+        off_flat.fill_diagonal_(float('-inf'))
+        vals, idx = off_flat.view(-1).topk(5)
+        print("    Top-5 最相似类对 (在该子集中的 local index):")
+        for v, i in zip(vals, idx):
+            r, c = i.item() // K, i.item() % K
+            print("      class {}↔{}: cos={:.4f}".format(r, c, v.item()))
+        # 打印 bottom-5 最不相似的类对
+        off_flat2 = S_teacher.clone()
+        off_flat2.fill_diagonal_(float('inf'))
+        vals_b, idx_b = off_flat2.view(-1).topk(5, largest=False)
+        print("    Bottom-5 最不相似类对:")
+        for v, i in zip(vals_b, idx_b):
+            r, c = i.item() // K, i.item() % K
+            print("      class {}↔{}: cos={:.4f}".format(r, c, v.item()))
+
         print("=" * 60 + "\n")
 
     def forward(self, w_s, w_t_full, current_iter):
@@ -286,5 +311,23 @@ class ELOTClosedLoss(nn.Module):
         # ===== 传输损失 =====
         pi_tensor = torch.from_numpy(pi).float().to(device)
         loss = torch.sum(pi_tensor * C)
+
+        # ===== π 诊断打印 =====
+        if current_iter % 50 == 0:
+            pi_diag_mass = np.diag(pi).sum()
+            pi_offdiag_mass = pi.sum() - pi_diag_mass
+            # π 中最大的 5 个非对角元素
+            pi_off = pi.copy()
+            np.fill_diagonal(pi_off, 0)
+            top5_idx = np.unravel_index(np.argsort(pi_off.ravel())[-5:], pi.shape)
+            top5_vals = pi_off[top5_idx]
+
+            print("  [ELOT] π diag_mass={:.4f} offdiag_mass={:.4f} | "
+                  "loss={:.4f}".format(pi_diag_mass, pi_offdiag_mass, loss.item()))
+            top5_str = ", ".join(
+                ["({},{})={:.4f}".format(r, c, v)
+                 for r, c, v in zip(top5_idx[0][::-1], top5_idx[1][::-1], top5_vals[::-1])]
+            )
+            print("  [ELOT] π top-5 offdiag: {}".format(top5_str))
 
         return loss

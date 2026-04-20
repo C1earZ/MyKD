@@ -15,10 +15,17 @@
 #       --path_t ./save/models/ResNet50_.../ResNet50_best.pth \
 #       --mode diagnose --epochs 3
 #
-#   # 调参模式: Optuna 自动搜索
+#   # 单子集调参模式: Optuna 自动搜索
 #   python tune_elot_closed.py \
 #       --path_t ./save/models/ResNet50_.../ResNet50_best.pth \
-#       --mode tune --epochs 30 --n_trials 20
+#       --mode tune --subset_id 0 --epochs 30 --n_trials 20 \
+#       --study_name elot_sub0_round1
+#
+#   # 全局调参模式 (5个子集平均):
+#   python tune_elot_closed.py \
+#       --path_t ./save/models/ResNet50_.../ResNet50_best.pth \
+#       --mode tune --epochs 30 --n_trials 20 \
+#       --study_name elot_global_round1
 #
 #   # 最终训练: 用找到的最优参数跑完整 240 epoch
 #   python tune_elot_closed.py \
@@ -270,6 +277,10 @@ def parse_args():
     parser.add_argument('--print_freq', type=int, default=100)
     parser.add_argument('--seed', type=int, default=0)
 
+    # 单子集调参
+    parser.add_argument('--subset_id', type=int, default=None, choices=[0, 1, 2, 3, 4],
+                        help='指定调参的子集编号 (0-4)。若不指定，则调所有子集的平均效果')
+
     # 优化器
     parser.add_argument('--learning_rate', type=float, default=0.05)
     parser.add_argument('--lr_decay_epochs', type=str, default='150,180,210')
@@ -294,10 +305,18 @@ def parse_args():
 
     # Optuna
     parser.add_argument('--n_trials', type=int, default=20)
-    parser.add_argument('--study_name', type=str, default='elot_closed_pca')
+    parser.add_argument('--study_name', type=str, default='elot_closed_pca',
+                        help='Optuna study 名称，不同调参轮次请用不同名称')
+    parser.add_argument('--db_dir', type=str, default='./optuna_db',
+                        help='存放 Optuna 数据库的文件夹')
 
     opt = parser.parse_args()
     opt.lr_decay_epochs = [int(x) for x in opt.lr_decay_epochs.split(',')]
+
+    # 创建数据库文件夹
+    if not os.path.isdir(opt.db_dir):
+        os.makedirs(opt.db_dir)
+
     return opt
 
 
@@ -317,14 +336,19 @@ def main():
             print("请先安装 Optuna: python -m pip install optuna")
             sys.exit(1)
 
+        # 确定要调参的子集列表
+        if opt.subset_id is not None:
+            subsets_to_tune = [opt.subset_id]
+            print("\n>>> 单子集调参模式: 子集 {}".format(opt.subset_id))
+        else:
+            subsets_to_tune = list(range(5))
+            print("\n>>> 全局调参模式: 5个子集平均")
+
         def objective(trial):
             # 搜索超参数
             opt.beta = trial.suggest_float('beta', 0.1, 50.0, log=True)
             opt.lambda_sem = trial.suggest_float('lambda_sem', 0.1, 10.0, log=True)
-            opt.warmup_iters = trial.suggest_categorical('warmup_iters',
-                                                          [100, 500, 1000, 2000])
-            opt.ot_epsilon = trial.suggest_float('ot_epsilon', 0.01, 1.0, log=True)
-            opt.beta_feat = trial.suggest_float('beta_feat', 10.0, 200.0, log=True)
+            opt.ot_epsilon = trial.suggest_float('ot_epsilon', 0.1, 10, log=True)
 
             print("\n>>> Trial {}: beta={:.3f}, lambda_sem={:.3f}, "
                   "warmup={}, epsilon={:.3f}, beta_feat={:.1f}".format(
@@ -332,29 +356,35 @@ def main():
                 opt.warmup_iters, opt.ot_epsilon, opt.beta_feat))
 
             accs = []
-            for subset_id in range(5):
+            for subset_id in subsets_to_tune:
                 acc = train_one_subset(subset_id, opt)
                 acc_val = acc.item() if torch.is_tensor(acc) else acc
                 accs.append(acc_val)
 
-                current_avg = np.mean(accs)
-                trial.report(current_avg, subset_id)
+                # 多子集模式才报告中间结果和剪枝
+                if len(subsets_to_tune) > 1:
+                    current_avg = np.mean(accs)
+                    trial.report(current_avg, subset_id)
 
-                if trial.should_prune():
-                    print("  >>> Trial {} 被剪枝 (子集{}, 平均={:.2f}%)".format(
-                        trial.number, subset_id, current_avg))
-                    raise optuna.TrialPruned()
+                    if trial.should_prune():
+                        print("  >>> Trial {} 被剪枝 (子集{}, 平均={:.2f}%)".format(
+                            trial.number, subset_id, current_avg))
+                        raise optuna.TrialPruned()
 
             avg_acc = np.mean(accs)
-            for sid in range(5):
-                trial.set_user_attr('subset_{}_acc'.format(sid), accs[sid])
+            for i, sid in enumerate(subsets_to_tune):
+                trial.set_user_attr('subset_{}_acc'.format(sid), accs[i])
 
             return avg_acc
+
+        # 数据库路径: {db_dir}/{study_name}.db
+        db_path = 'sqlite:///{}'.format(os.path.join(opt.db_dir, opt.study_name + '.db'))
+        print(">>> 数据库路径: {}".format(db_path))
 
         study = optuna.create_study(
             study_name=opt.study_name,
             direction='maximize',
-            storage='sqlite:///optuna_elot_closed_pca.db',
+            storage=db_path,
             load_if_exists=True,
             pruner=optuna.pruners.MedianPruner(
                 n_startup_trials=5,
@@ -368,18 +398,18 @@ def main():
         print("  Optuna 调参完成!")
         print("=" * 60)
         print("  最佳 trial: #{}".format(study.best_trial.number))
-        print("  最佳平均准确率: {:.2f}%".format(study.best_value))
+        print("  最佳准确率: {:.2f}%".format(study.best_value))
         print("  最佳参数:")
         for key, value in study.best_params.items():
             print("    {} = {}".format(key, value))
         print("=" * 60)
 
         print("\n  最佳 trial 各子集结果:")
-        for sid in range(5):
+        for sid in subsets_to_tune:
             key = 'subset_{}_acc'.format(sid)
             if key in study.best_trial.user_attrs:
                 print("    子集 {}: {:.2f}%".format(
-                    sid, study.best_trial.user_attrs[key]))
+                    sid, study.best_trial.user_attrs[sid]))
 
     elif opt.mode == 'train':
         print("\n>>> 最终训练模式: {} epochs".format(opt.epochs))
