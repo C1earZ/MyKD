@@ -369,10 +369,14 @@ def main():
                 opt.ot_epsilon = trial.suggest_float('ot_epsilon', 0.1, 10.0, log=True)
                 range_desc = "global full ranges"
 
+            # Round 3 新增: ELOT 特有参数
+            opt.warmup_iters = trial.suggest_int('warmup_iters', 50, 3000, log=True)
+            opt.nb_dummies   = trial.suggest_categorical('nb_dummies', [1, 2, 3, 5, 7, 10])
+
             print("\n>>> Trial {} ({}): beta={:.3f}, lambda_sem={:.3f}, "
-                  "warmup={}, epsilon={:.3f}, beta_feat={:.1f}".format(
+                  "warmup={}, nb_dummies={}, epsilon={:.3f}, beta_feat={:.1f}".format(
                 trial.number, range_desc, opt.beta, opt.lambda_sem,
-                opt.warmup_iters, opt.ot_epsilon, opt.beta_feat))
+                opt.warmup_iters, opt.nb_dummies, opt.ot_epsilon, opt.beta_feat))
 
             accs = []
             for subset_id in subsets_to_tune:
