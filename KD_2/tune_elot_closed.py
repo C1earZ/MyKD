@@ -63,6 +63,16 @@ from distiller_zoo.FitNet import HintLoss
 from helper.train_elot_closed import train_distill_elot_closed
 
 
+# Round 2 每子集独立搜索范围 (基于 round 1 Top-15 IQR x [0.5, 2.0], 限制在原范围内)
+SUBSET_SEARCH_RANGES = {
+    0: {'beta': (0.91, 30.71), 'lambda_sem': (0.78, 10.0), 'ot_epsilon': (0.20, 10.0)},
+    1: {'beta': (0.11,  3.47), 'lambda_sem': (0.24,  8.75), 'ot_epsilon': (0.67,  6.53)},
+    2: {'beta': (2.47, 27.42), 'lambda_sem': (0.59,  7.08), 'ot_epsilon': (0.55,  4.75)},
+    3: {'beta': (0.58, 12.49), 'lambda_sem': (0.10,  3.14), 'ot_epsilon': (0.16,  2.13)},
+    4: {'beta': (0.11,  3.88), 'lambda_sem': (0.67,  6.43), 'ot_epsilon': (0.91, 10.0)},
+}
+
+
 def set_random_seed(seed, deterministic=False):
     random.seed(seed)
     np.random.seed(seed)
@@ -345,15 +355,27 @@ def main():
             print("\n>>> 全局调参模式: 5个子集平均")
 
         def objective(trial):
-            # 搜索超参数
-            opt.beta = trial.suggest_float('beta', 0.1, 50.0, log=True)
-            opt.lambda_sem = trial.suggest_float('lambda_sem', 0.1, 10.0, log=True)
-            opt.ot_epsilon = trial.suggest_float('ot_epsilon', 0.1, 10, log=True)
+            # 搜索超参数: 单子集模式下使用 round 2 的缩小范围, 否则回退到原全范围
+            if opt.subset_id is not None and opt.subset_id in SUBSET_SEARCH_RANGES:
+                r = SUBSET_SEARCH_RANGES[opt.subset_id]
+                opt.beta       = trial.suggest_float('beta',       *r['beta'],       log=True)
+                opt.lambda_sem = trial.suggest_float('lambda_sem', *r['lambda_sem'], log=True)
+                opt.ot_epsilon = trial.suggest_float('ot_epsilon', *r['ot_epsilon'], log=True)
+                range_desc = "sub{} round2 ranges: beta{}, lam{}, eps{}".format(
+                    opt.subset_id, r['beta'], r['lambda_sem'], r['ot_epsilon'])
+            else:
+                opt.beta       = trial.suggest_float('beta',       0.1, 50.0, log=True)
+                opt.lambda_sem = trial.suggest_float('lambda_sem', 0.1, 10.0, log=True)
+                opt.ot_epsilon = trial.suggest_float('ot_epsilon', 0.1, 10.0, log=True)
+                range_desc = "global full ranges"
 
-            print("\n>>> Trial {}: beta={:.3f}, lambda_sem={:.3f}, "
-                  "warmup={}, epsilon={:.3f}, beta_feat={:.1f}".format(
-                trial.number, opt.beta, opt.lambda_sem,
-                opt.warmup_iters, opt.ot_epsilon, opt.beta_feat))
+            # Round 3 新增: ELOT 特有参数
+            opt.warmup_iters = trial.suggest_int('warmup_iters', 50, 3000, log=True)
+
+            print("\n>>> Trial {} ({}): beta={:.3f}, lambda_sem={:.3f}, "
+                  "warmup={}, nb_dummies={}, epsilon={:.3f}, beta_feat={:.1f}".format(
+                trial.number, range_desc, opt.beta, opt.lambda_sem,
+                opt.warmup_iters, opt.nb_dummies, opt.ot_epsilon, opt.beta_feat))
 
             accs = []
             for subset_id in subsets_to_tune:
@@ -409,7 +431,7 @@ def main():
             key = 'subset_{}_acc'.format(sid)
             if key in study.best_trial.user_attrs:
                 print("    子集 {}: {:.2f}%".format(
-                    sid, study.best_trial.user_attrs[sid]))
+                    sid, study.best_trial.user_attrs[key]))
 
     elif opt.mode == 'train':
         print("\n>>> 最终训练模式: {} epochs".format(opt.epochs))
